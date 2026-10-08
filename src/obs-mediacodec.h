@@ -20,9 +20,14 @@ struct mediacodec_encoder {
 	uint8_t *extra_data;
 	size_t extra_data_size;
 
+	uint8_t *packet_buffer;
+	size_t packet_buffer_size;
+
 	int64_t pts_queue[256];
 	int pts_head;
 	int pts_tail;
+	
+	bool eos_signaled;
 };
 
 /* ------------------------------------------------------------------------- */

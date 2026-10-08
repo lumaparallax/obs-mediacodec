@@ -7,6 +7,7 @@ void *mediacodec_create_internal(obs_data_t *settings, obs_encoder_t *encoder, c
 {
 	struct mediacodec_encoder *ctx = bzalloc(sizeof(*ctx));
 	ctx->encoder = encoder;
+	ctx->eos_signaled = false;
 
 	video_t *video = obs_encoder_video(encoder);
 	const struct video_output_info *voi = video_output_get_info(video);
@@ -15,15 +16,15 @@ void *mediacodec_create_internal(obs_data_t *settings, obs_encoder_t *encoder, c
 	ctx->height = obs_encoder_get_height(encoder);
 
 	int bitrate = (int)(obs_data_get_int(settings, "bitrate") * 1000);
-  int max_bitrate = (int)(obs_data_get_int(settings, "max_bitrate") * 1000);
+	int max_bitrate = (int)(obs_data_get_int(settings, "max_bitrate") * 1000);
 	int keyint = (int)obs_data_get_int(settings, "keyint_sec");
-  if (keyint <= 0) {
-    keyint = 2;
-  }
+	if (keyint <= 0) {
+		keyint = 2;
+	}
 
-  const char *rc = obs_data_get_string(settings, "rate_control");
-  int rc_mode = 2;
-  if (strcmp(rc, "VBR") == 0) rc_mode = 1;
+	const char *rc = obs_data_get_string(settings, "rate_control");
+	int rc_mode = 2;
+	if (strcmp(rc, "VBR") == 0) rc_mode = 1;
 
 	ctx->codec = AMediaCodec_createEncoderByType(mime);
 	if (!ctx->codec) {
@@ -39,12 +40,15 @@ void *mediacodec_create_internal(obs_data_t *settings, obs_encoder_t *encoder, c
 	AMediaFormat_setInt32(ctx->format, "i-frame-interval", keyint);
 	AMediaFormat_setInt32(ctx->format, "color-format", 0x7F000789);
 	AMediaFormat_setInt32(ctx->format, "bitrate-mode", rc_mode);
-  if (rc_mode == 1) {
-    AMediaFormat_setInt32(ctx->format, "max-bitrate", max_bitrate);
-  }
+	if (rc_mode == 1) {
+		AMediaFormat_setInt32(ctx->format, "max-bitrate", max_bitrate);
+	}
 
 	if (AMediaCodec_configure(ctx->codec, ctx->format, NULL, NULL, AMEDIACODEC_CONFIGURE_FLAG_ENCODE) != AMEDIA_OK) {
-		goto fail;
+		AMediaFormat_setInt32(ctx->format, "bitrate-mode", 0);
+		if (AMediaCodec_configure(ctx->codec, ctx->format, NULL, NULL, AMEDIACODEC_CONFIGURE_FLAG_ENCODE) != AMEDIA_OK) {
+			goto fail;
+		}
 	}
 
 	if (AMediaCodec_createInputSurface(ctx->codec, &ctx->window) != AMEDIA_OK || !ctx->window) {
@@ -94,6 +98,8 @@ void mediacodec_destroy(void *data)
 		AMediaFormat_delete(ctx->format);
 	if (ctx->extra_data)
 		bfree(ctx->extra_data);
+	if (ctx->packet_buffer)
+		bfree(ctx->packet_buffer);
 
 	bfree(ctx);
 }
@@ -106,7 +112,12 @@ bool mediacodec_encode(void *data, struct encoder_frame *frame, struct encoder_p
 	struct mediacodec_encoder *ctx = data;
 	*received_packet = false;
 
-	if (frame && ctx->window) {
+	if (!frame) {
+		if (ctx->window && !ctx->eos_signaled) {
+			AMediaCodec_signalEndOfInputStream(ctx->codec);
+			ctx->eos_signaled = true;
+		}
+	} else if (ctx->window) {
 		ANativeWindow_Buffer out_buffer;
 		if (ANativeWindow_lock(ctx->window, &out_buffer, NULL) == 0) {
 			uint8_t *dst = (uint8_t *)out_buffer.bits;
@@ -128,85 +139,122 @@ bool mediacodec_encode(void *data, struct encoder_frame *frame, struct encoder_p
 		}
 	}
 
-	AMediaCodecBufferInfo info;
-	ssize_t out_idx = AMediaCodec_dequeueOutputBuffer(ctx->codec, &info, 0);
+	int64_t timeout_us = frame ? 0 : 10000; 
+	int flush_retries = 0;
 
-	if (out_idx >= 0) {
-		size_t out_size;
-		uint8_t *out_buf = AMediaCodec_getOutputBuffer(ctx->codec, out_idx, &out_size);
+	while (true) {
+		AMediaCodecBufferInfo info;
+		ssize_t out_idx = AMediaCodec_dequeueOutputBuffer(ctx->codec, &info, timeout_us);
 
-		if (out_buf && info.size > 0) {
-			if (info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG) {
-				if (ctx->extra_data) {
-          bfree(ctx->extra_data);
-          ctx->extra_data = NULL;
-        }
-				ctx->extra_data = bmemdup(out_buf + info.offset, info.size);
-				ctx->extra_data_size = info.size;
-			} else {
-				if (!ctx->extra_data && (info.flags & AMEDIACODEC_BUFFER_FLAG_KEY_FRAME)) {
-					AMediaFormat *fmt = AMediaCodec_getOutputFormat(ctx->codec);
-					if (fmt) {
-						void *csd0 = NULL;
-						size_t csd0_sz = 0;
-						void *csd1 = NULL;
-						size_t csd1_sz = 0;
+		if (out_idx == AMEDIACODEC_INFO_TRY_AGAIN_LATER) {
+			if (!frame) {
+				flush_retries++;
+				if (flush_retries > 50) { 
+					blog(LOG_WARNING, "[obs-mediacodec] Flush timed out waiting for End Of Stream.");
+					break;
+				}
+				continue;
+			}
+			break; 
+		} else if (out_idx == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
+			AMediaFormat *new_format = AMediaCodec_getOutputFormat(ctx->codec);
+			if (new_format && !ctx->extra_data) {
+				void *csd0_data = NULL;
+				size_t csd0_size = 0;
+				void *csd1_data = NULL;
+				size_t csd1_size = 0;
 
-						AMediaFormat_getBuffer(fmt, "csd-0", &csd0, &csd0_sz);
-						AMediaFormat_getBuffer(fmt, "csd-1", &csd1, &csd1_sz);
+				AMediaFormat_getBuffer(new_format, "csd-0", &csd0_data, &csd0_size);
+				AMediaFormat_getBuffer(new_format, "csd-1", &csd1_data, &csd1_size);
 
-						if (csd0_sz > 0) {
-							ctx->extra_data_size = csd0_sz + csd1_sz;
-							ctx->extra_data = bmalloc(ctx->extra_data_size);
-							memcpy(ctx->extra_data, csd0, csd0_sz);
-							if (csd1_sz > 0)
-								memcpy(ctx->extra_data + csd0_sz, csd1, csd1_sz);
+				if (csd0_size > 0) {
+					if (ctx->extra_data) {
+						bfree(ctx->extra_data);
+						ctx->extra_data = NULL;
+					}
+					ctx->extra_data_size = csd0_size + csd1_size;
+					ctx->extra_data = bmalloc(ctx->extra_data_size);
+					memcpy(ctx->extra_data, csd0_data, csd0_size);
+					if (csd1_size > 0)
+						memcpy(ctx->extra_data + csd0_size, csd1_data, csd1_size);
+				}
+				AMediaFormat_delete(new_format);
+			}
+			continue; 
+		} else if (out_idx >= 0) {
+			
+			if (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) {
+				AMediaCodec_releaseOutputBuffer(ctx->codec, out_idx, false);
+				break;
+			}
+
+			size_t out_size;
+			uint8_t *out_buf = AMediaCodec_getOutputBuffer(ctx->codec, out_idx, &out_size);
+
+			if (out_buf && info.size > 0) {
+				if (info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG) {
+					if (ctx->extra_data) {
+						bfree(ctx->extra_data);
+						ctx->extra_data = NULL;
+					}
+					ctx->extra_data = bmemdup(out_buf + info.offset, info.size);
+					ctx->extra_data_size = info.size;
+					
+					AMediaCodec_releaseOutputBuffer(ctx->codec, out_idx, false);
+					continue; 
+				} else {
+					if (!ctx->extra_data && (info.flags & AMEDIACODEC_BUFFER_FLAG_KEY_FRAME)) {
+						AMediaFormat *fmt = AMediaCodec_getOutputFormat(ctx->codec);
+						if (fmt) {
+							void *csd0 = NULL;
+							size_t csd0_sz = 0;
+							void *csd1 = NULL;
+							size_t csd1_sz = 0;
+
+							AMediaFormat_getBuffer(fmt, "csd-0", &csd0, &csd0_sz);
+							AMediaFormat_getBuffer(fmt, "csd-1", &csd1, &csd1_sz);
+
+							if (csd0_sz > 0) {
+								ctx->extra_data_size = csd0_sz + csd1_sz;
+								ctx->extra_data = bmalloc(ctx->extra_data_size);
+								memcpy(ctx->extra_data, csd0, csd0_sz);
+								if (csd1_sz > 0)
+									memcpy(ctx->extra_data + csd0_sz, csd1, csd1_sz);
+							}
+							AMediaFormat_delete(fmt);
 						}
-						AMediaFormat_delete(fmt);
+					}
+
+					if (ctx->extra_data) {
+						if (info.size > ctx->packet_buffer_size) {
+							ctx->packet_buffer = brealloc(ctx->packet_buffer, info.size);
+							ctx->packet_buffer_size = info.size;
+						}
+						memcpy(ctx->packet_buffer, out_buf + info.offset, info.size);
+
+						int64_t correct_pts = ctx->pts_queue[ctx->pts_tail];
+						ctx->pts_tail = (ctx->pts_tail + 1) % 256;
+
+						packet->type = OBS_ENCODER_VIDEO;
+						packet->pts = correct_pts;
+						packet->dts = correct_pts;
+						packet->data = ctx->packet_buffer;
+						packet->size = info.size;
+						packet->keyframe = (info.flags & AMEDIACODEC_BUFFER_FLAG_KEY_FRAME) != 0;
+						*received_packet = true;
+					} else {
+						blog(LOG_WARNING, "[obs-mediacodec] Dropping frame: Waiting for codec configuration headers");
 					}
 				}
-
-				if (ctx->extra_data) {
-					int64_t correct_pts = ctx->pts_queue[ctx->pts_tail];
-					ctx->pts_tail = (ctx->pts_tail + 1) % 256;
-
-					packet->type = OBS_ENCODER_VIDEO;
-					packet->pts = correct_pts;
-					packet->dts = correct_pts;
-					packet->data = out_buf + info.offset;
-					packet->size = info.size;
-					packet->keyframe = (info.flags & AMEDIACODEC_BUFFER_FLAG_KEY_FRAME) != 0;
-					*received_packet = true;
-				} else {
-					blog(LOG_WARNING, "[obs-mediacodec] Dropping frame: Waiting for codec configuration headers");
-				}
 			}
-		}
-		AMediaCodec_releaseOutputBuffer(ctx->codec, out_idx, false);
-
-	} else if (out_idx == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
-		AMediaFormat *new_format = AMediaCodec_getOutputFormat(ctx->codec);
-		if (new_format && !ctx->extra_data) {
-			void *csd0_data = NULL;
-			size_t csd0_size = 0;
-			void *csd1_data = NULL;
-			size_t csd1_size = 0;
-
-			AMediaFormat_getBuffer(new_format, "csd-0", &csd0_data, &csd0_size);
-			AMediaFormat_getBuffer(new_format, "csd-1", &csd1_data, &csd1_size);
-
-			if (csd0_size > 0) {
-        if (ctx->extra_data) {
-          bfree(ctx->extra_data);
-          ctx->extra_data = NULL;
-        }
-				ctx->extra_data_size = csd0_size + csd1_size;
-				ctx->extra_data = bmalloc(ctx->extra_data_size);
-				memcpy(ctx->extra_data, csd0_data, csd0_size);
-				if (csd1_size > 0)
-					memcpy(ctx->extra_data + csd0_size, csd1_data, csd1_size);
+			
+			AMediaCodec_releaseOutputBuffer(ctx->codec, out_idx, false);
+			
+			if (*received_packet || !ctx->extra_data) {
+				break; 
 			}
-			AMediaFormat_delete(new_format);
+		} else {
+			break; 
 		}
 	}
 
@@ -268,3 +316,4 @@ obs_properties_t *mediacodec_get_properties(void *unused)
 
 	return props;
 }
+
